@@ -1,32 +1,62 @@
 function scheduleHtmlParser() {
   // 配置常量
   const CONFIG = {
-    TERM_API: 'https://ehall.seu.edu.cn/jwapp/sys/wdkb/modules/jshkcb/xnxqcx.do',
-    SCHEDULE_API: 'https://ehall.seu.edu.cn/jwapp/sys/wdkb/modules/xskcb/xskcb.do',
+    APP_BASE: 'https://ehall.seu.edu.cn/jwapp/sys/bykb',
+    CURRENT_TERM_API: '/modules/jshkcb/dqxnxq.do',
+    TERM_LIST_API: '/modules/jshkcb/xnxqcx.do',
+    SCHEDULE_API: '/modules/xskcb/cxxszhxqkb.do',
   };
 
-  // 同步HTTP GET请求
-  const httpGet = (url) => {
+  const buildUrl = (path) => {
+    if (typeof WIS_EMAP_SERV !== 'undefined' && WIS_EMAP_SERV.getAbsPath) {
+      return WIS_EMAP_SERV.getAbsPath(path);
+    }
+    return `${CONFIG.APP_BASE}${path}`;
+  };
+
+  const encodeParams = (params = {}) => {
+    return Object.keys(params)
+      .map(key => `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`)
+      .join('&');
+  };
+
+  // 同步请求，优先使用页面自己的 EMAP Ajax 封装
+  const syncRequest = (path, params = {}) => {
+    const url = buildUrl(path);
+
+    if (typeof BH_UTILS !== 'undefined' && BH_UTILS.doSyncAjax) {
+      return BH_UTILS.doSyncAjax(url, params);
+    }
+
     const xhr = new XMLHttpRequest();
-    xhr.open('GET', url, false); // 保持同步模式
-    xhr.send();
+    xhr.open('POST', url, false); // 保持同步模式
+    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
+    xhr.setRequestHeader('Accept', 'application/json, text/javascript, */*; q=0.01');
+    xhr.send(encodeParams(params));
     if (xhr.status !== 200) {
       throw new Error(`HTTP Error: ${xhr.status}`);
     }
     return JSON.parse(xhr.responseText);
   };
 
-  // 获取学期列表（按时间排序：旧→新）
-  const fetchTerms = () => {
-    const data = httpGet(CONFIG.TERM_API);
-    return data.datas.xnxqcx.rows.sort((a, b) => a.PX - b.PX);
+  // 获取当前学期；若接口异常，回退到学期列表最新项
+  const fetchCurrentTerm = () => {
+    const data = syncRequest(CONFIG.CURRENT_TERM_API);
+    const rows = data?.datas?.dqxnxq?.rows || [];
+    if (rows.length > 0) return rows[0];
+
+    const termListData = syncRequest(CONFIG.TERM_LIST_API, { '*order': '-DM' });
+    const termRows = termListData?.datas?.xnxqcx?.rows || [];
+    return termRows[0];
   };
 
   // 获取原始课表数据
   const fetchSchedule = (termCode) => {
-    const url = `${CONFIG.SCHEDULE_API}?XNXQDM=${termCode}`;
-    const data = httpGet(url);
-    return data.datas.xskcb.rows;
+    const data = syncRequest(CONFIG.SCHEDULE_API, {
+      '*order': '+KSJC,+JSJC',
+      XNXQDM: termCode,
+    });
+    return data?.datas?.cxxszhxqkb?.rows || [];
   };
 
   // 解析周次（优先使用bitmap，回退到文本解析）
@@ -44,7 +74,7 @@ function scheduleHtmlParser() {
     if (!zcmcText) return [];
 
     const weekSet = new Set();
-    const parts = zcmcText.split(',');
+    const parts = zcmcText.split(/[，,;；]/);
 
     parts.forEach(part => {
       const match = part.match(/(\d+)(?:-(\d+))?周?(?:\((单|双)\))?/);
@@ -74,18 +104,23 @@ function scheduleHtmlParser() {
     const weeks = parseWeeks(raw.ZCMC, raw.SKZC);
     if (weeks.length === 0) return null;
 
+    const weekTime = parseInt(raw.SKXQ, 10);
+    const startTime = parseInt(raw.KSJC, 10);
+    const endTime = parseInt(raw.JSJC, 10);
+    if (!weekTime || !startTime || !endTime || endTime < startTime) return null;
+
     return {
       name: raw.KCM,
-      classroom: raw.JASMC,
+      classroom: raw.JASMC || raw.JASMC_DISPLAY || '',
       class_number: raw.KCH,
       teacher: raw.SKJS,
       test_time: null,
       test_location: null,
       link: null,
       weeks: weeks,
-      week_time: parseInt(raw.SKXQ, 10),
-      start_time: parseInt(raw.KSJC, 10),
-      time_count: parseInt(raw.JSJC, 10) - parseInt(raw.KSJC, 10), // 不 +1
+      week_time: weekTime,
+      start_time: startTime,
+      time_count: endTime - startTime, // 不 +1
       import_type: 1,
       info: raw.ZCMC,
       data: null,
@@ -94,9 +129,8 @@ function scheduleHtmlParser() {
 
   // 主流程
   try {
-    // 步骤1：获取当前学期（取排序后的第一个）
-    const terms = fetchTerms();
-    const currentTerm = terms[0];
+    // 步骤1：获取当前学期
+    const currentTerm = fetchCurrentTerm();
 
     if (!currentTerm?.DM) {
       throw new Error('无法获取当前学期信息');
